@@ -4,78 +4,45 @@
 
 elm-build's `PureTestRunner` already has everything mutation testing needs:
 
-- **Tests run as pure Elm functions** via `Test.Runner` — no subprocess per test run, no elm-test CLI
+- **Tests run via elm-interpreter** — code under test is evaluated from source at runtime, not compiled by elm/lamdera. The script itself is compiled once, but test execution interprets Elm source directly. This means **mutating source = mutating behavior with zero recompilation**.
+- **Source files are already in memory** — `setupSourceFiles` reads all `.elm` files via `BackendTask.File.rawFile`
+- **`elm-syntax` is already a dependency** (`stil4m/elm-syntax: 7.3.9`) — parse Elm source into a full AST, apply mutation transforms, and feed the mutated AST/source back to the interpreter. All in pure Elm, all in memory.
 - **Dependency graph** (`DepGraph`) knows which tests transitively depend on which source files — so you only re-run affected tests per mutation
-- **Content-addressed caching** (`Cache`) means if you mutate file A but test T only depends on file B, T's cached result is reused automatically
-- **`elm-syntax` is already a dependency** (`stil4m/elm-syntax: 7.3.9`) — you can parse Elm source into a full AST, generate mutations, and pretty-print back, all in pure Elm. No external binary needed.
-- **`Cache.compute`** is the perfect primitive for caching mutation test results — each (mutation, test) pair gets a deterministic hash
+- **Content-addressed caching** (`Cache`) means identical mutation+test combinations are never re-executed
 
 ### Architecture
 
+The mutation loop is **entirely in-memory** — no disk I/O, no recompilation, no temp directories:
+
 ```
-Source files (in memory from setupSourceFiles)
+Source files (already in memory from setupSourceFiles)
         |
         v
   Parse with elm-syntax → AST
         |
         v
   Generate mutations (AST → AST transforms)
-  Each mutation = { file, location, operator, mutatedSource }
+  Each mutation = { file, location, operator, mutatedAST }
         |
         v
   For each mutation:
-    1. Compute new source hash (changed file has different content)
-    2. Look up affected tests via DepGraph.transitiveDeps (reverse lookup)
-    3. Re-run only affected tests via Cache.compute (with mutated hash as input)
-    4. Record result: killed (test failed = good) or survived (all passed = weak test)
+    1. Feed mutated source/AST to the interpreter
+    2. Run affected tests (DepGraph reverse lookup tells you which ones)
+    3. Did any test fail?
+       - Yes → mutant killed (test suite is strong here)
+       - No  → mutant survived (test suite is weak here)
         |
         v
   Report: list of surviving mutants with location + description
 ```
 
-### The recompilation question
+**Key insight**: since the interpreter evaluates source at runtime, the mutation loop is just:
 
-There's one fundamental constraint: `PureTestRunner` compiles tests into the elm-pages script itself. Mutating a source string at runtime doesn't change the compiled code.
-
-Two approaches to handle this:
-
-**Approach A: Recompile per mutation (accurate, slower)**
-
-For each mutation:
-1. Write mutated source file to a temp copy of the project
-2. Use `Cache.commandInWritableDirectory` to run `lamdera make` on the mutated project
-3. Run the compiled output and collect test results
-4. The cache means identical mutations (same hash) skip recompilation
-
-This is the traditional mutation testing approach. elm-build's cache makes it faster than naive mutation testing because:
-- Only the mutated module recompiles (Lamdera incremental compilation)
-- Unaffected test results come from cache
-- You can batch mutations to the same file and reuse the compilation workspace
-
-**Approach B: Expression-level mutation via test wrappers (fast, limited scope)**
-
-Instead of mutating source and recompiling, design test helpers that test multiple variants:
-
-```elm
--- A module that provides "mutation-aware" assertions
-MutationTest.withMutations
-    { original = myFunction
-    , mutations =
-        [ { name = "negate comparison", fn = myFunction_mutated1 }
-        , { name = "swap branches", fn = myFunction_mutated2 }
-        ]
-    }
-    (\fn -> fn input |> Expect.equal expected)
+```
+parse → transform AST → interpret → check test results → next mutation
 ```
 
-This is more like property-based testing with explicit variants. It's fast (no recompilation) but requires the user to define mutation targets.
-
-**Approach C (recommended for PoC): Source-level mutation with batch recompilation**
-
-1. Generate all mutations upfront (pure Elm, using elm-syntax)
-2. Group mutations by file
-3. For each mutated file, write it + recompile + run affected tests
-4. Use `Cache.commandInWritableDirectory` for the compile step so elm-stuff is reused across mutations to the same file
+No `lamdera make`. No writing files to disk. No subprocesses. This is as fast as mutation testing can get — it's bounded by interpreter speed, not compilation speed.
 
 ### Step-by-step implementation
 
@@ -93,8 +60,10 @@ import Elm.Syntax.Node exposing (Node(..))
 type alias Mutation =
     { filePath : String
     , line : Int
+    , column : Int
+    , operator : String
     , description : String
-    , mutatedSource : String
+    , apply : RawFile -> RawFile  -- AST → AST transform
     }
 
 generateMutations : String -> String -> List Mutation
@@ -103,13 +72,13 @@ generateMutations filePath source =
         Ok rawFile ->
             rawFile
                 |> findMutableExpressions
-                |> List.concatMap (applyMutationOperators source)
+                |> List.concatMap (applyMutationOperators filePath)
 
         Err _ ->
             []
 ```
 
-Mutation operators to implement (start with a few, expand later):
+Mutation operators (start with highest-value, expand later):
 
 | Operator | Transform | What it catches |
 |---|---|---|
@@ -117,8 +86,10 @@ Mutation operators to implement (start with a few, expand later):
 | `swapComparison` | `>` → `>=`, `==` → `/=` | Off-by-one, boundary conditions |
 | `replaceWithIdentity` | `f x` → `x` | Tests that don't verify the transformation |
 | `swapBooleanLiteral` | `True` → `False` | Hardcoded boolean checks |
-| `removeListElement` | `[a, b, c]` → `[a, c]` | Tests that don't check list contents |
 | `replaceArithmetic` | `+` → `-`, `*` → `//` | Arithmetic correctness |
+| `removeListElement` | `[a, b, c]` → `[a, c]` | Tests that don't check list contents |
+
+For the PoC, just `negateCondition` and `swapComparison` are enough to prove the concept.
 
 #### Step 2: Add a mutation test runner script
 
@@ -133,14 +104,20 @@ run =
 
 task : Config -> BackendTask FatalError ()
 task config =
-    -- 1. Read all source files (reuse setupSourceFiles from PureTestRunner)
-    Do.do (setupSourceFiles (Path.path ".")) <| \{ inputsByPath, depGraph } ->
+    -- 1. Read all source files into memory
+    Do.do (readSourceFiles (Path.path ".")) <| \sources ->
 
-    -- 2. Generate mutations for each source file
-    Do.do (generateAllMutations inputsByPath) <| \mutations ->
+    -- 2. Parse each source file and generate mutations
+    let
+        mutations =
+            sources
+                |> List.concatMap (\( path, content ) ->
+                    Mutator.generateMutations path content
+                )
+    in
 
-    -- 3. For each mutation, run affected tests
-    Do.do (runMutations config mutations depGraph) <| \results ->
+    -- 3. For each mutation, interpret the mutated source and run tests
+    Do.do (runAllMutations sources mutations) <| \results ->
 
     -- 4. Display report
     displayMutationReport results
@@ -148,31 +125,49 @@ task config =
 
 #### Step 3: Implement the mutation loop
 
-For each mutation:
+The core loop — for each mutation, swap the AST, interpret, and run affected tests:
 
 ```elm
 runSingleMutation :
-    Config
+    Dict String String          -- all source files (path → content)
     -> DepGraph.Graph
+    -> List Test.Runner.Runner  -- the test suite
     -> Mutation
-    -> Cache.Monad MutationResult
-runSingleMutation config depGraph mutation =
+    -> MutationResult
+runSingleMutation sources depGraph runners mutation =
     let
-        -- Which tests depend on the mutated file?
-        affectedTests : Set String
-        affectedTests =
-            DepGraph.reverseDeps depGraph mutation.filePath
+        -- Apply the mutation: replace the original source with mutated version
+        mutatedSources =
+            Dict.update mutation.filePath
+                (\_ -> Just (mutation.apply originalAST |> prettyPrint))
+                sources
 
-        -- Write the mutated project to a temp directory
-        -- and compile + run affected tests
+        -- Which tests are affected by this file change?
+        affectedRunners =
+            runners
+                |> List.filter (\runner ->
+                    let
+                        testFile = resolveTestFile runner.labels
+                    in
+                    Set.member mutation.filePath
+                        (DepGraph.transitiveDeps depGraph testFile)
+                )
+
+        -- Run affected tests against the mutated source via interpreter
+        results =
+            affectedRunners
+                |> List.map (\runner -> interpretAndRun mutatedSources runner)
+
+        anyFailed =
+            List.any .failed results
     in
-    Cache.commandInWritableDirectory "lamdera"
-        [ "make", "TestRunner.elm", "--output", "elm.js" ]
-        projectHash
-    <| \compiledHash ->
-        -- Run tests in the compiled output, check for failures
-        ...
+    if anyFailed then
+        Killed { mutation = mutation, killedBy = List.filter .failed results }
+    else
+        Survived { mutation = mutation, testsRun = List.length results }
 ```
+
+The critical line is `interpretAndRun mutatedSources runner` — this feeds the mutated source to the interpreter instead of using compiled code. The exact API depends on how the elm-interpreter is integrated, but the concept is: give it a modified source environment, ask it to evaluate the test.
 
 #### Step 4: Add reverse dependency lookup to DepGraph
 
@@ -181,14 +176,16 @@ Currently `DepGraph.transitiveDeps` goes forward (file → what it depends on). 
 ```elm
 reverseDeps : Graph -> String -> Set String
 reverseDeps (Graph { deps }) targetFile =
+    -- For every file in the graph, check if targetFile is in its transitive deps
     deps
-        |> Dict.toList
-        |> List.filter (\( _, fileDeps ) -> Set.member targetFile fileDeps)
-        |> List.map Tuple.first
+        |> Dict.keys
+        |> List.filter (\file ->
+            Set.member targetFile (transitiveDeps (Graph { deps }) file)
+        )
         |> Set.fromList
 ```
 
-Or precompute a reverse index for efficiency.
+Or precompute a reverse adjacency list from the forward graph for efficiency.
 
 #### Step 5: LLM-optimized output format
 
@@ -219,37 +216,48 @@ The report should be structured for LLM consumption:
 }
 ```
 
-### What makes this faster than traditional mutation testing
+### Why this is so fast
 
-1. **No elm-test subprocess overhead** — tests run as pure functions in-process
-2. **Dependency-guided test selection** — DepGraph already knows the graph, only run affected tests
-3. **Content-addressed caching** — identical source hashes skip recompilation and test execution entirely
-4. **Incremental compilation** — Lamdera only recompiles the mutated module + dependents
-5. **Batch mutations per file** — reuse the same compilation workspace for multiple mutations to one file
+No recompilation. The interpreter evaluates source directly, so mutations are instant:
+
+1. **AST transform** — microseconds (swap a node in the syntax tree)
+2. **Interpret mutated source** — milliseconds (interpreter evaluates the changed function)
+3. **Run affected tests** — milliseconds (pure function calls, filtered by DepGraph)
+4. **No disk I/O** — sources stay in memory, no temp files, no file copies
+5. **No subprocess overhead** — everything runs in-process
+
+Compare to traditional mutation testing (e.g., Stryker, PIT):
+- Traditional: mutate → write file → recompile → spawn test process → collect results → repeat
+- elm-build: mutate AST in memory → interpret → check results → repeat
+
+The bottleneck shifts from compilation to interpretation speed, which is orders of magnitude faster for the "mutate one expression, run a few tests" loop.
 
 ### Files to create/modify in elm-build
 
 | File | Description |
 |---|---|
-| `src/Mutator.elm` (new) | Elm-syntax based mutation generator |
-| `src/MutationTestRunner.elm` (new) | elm-pages script that orchestrates mutation testing |
+| `src/Mutator.elm` (new) | elm-syntax based mutation generator — parse, transform, generate variants |
+| `src/MutationTestRunner.elm` (new) | elm-pages script that orchestrates the mutation loop |
 | `src/DepGraph.elm` (modify) | Add `reverseDeps` for affected-test lookup |
-| `src/SampleTests.elm` (no change) | Existing tests serve as the test suite |
+| `src/SampleTests.elm` (no change) | Existing tests serve as the test suite to check mutations against |
 
 ### PoC scope
 
-For an initial PoC, keep it minimal:
+Keep it minimal to prove the concept:
 
-1. **2-3 mutation operators** — `negateCondition` and `swapComparison` are the highest value
-2. **Single file target** — mutate one source file, run all tests (skip DepGraph optimization initially)
-3. **Recompile per mutation** — use `Cache.commandInWritableDirectory` with `lamdera make`
-4. **Text output** — print surviving mutants to console, skip JSON report initially
+1. **2 mutation operators** — `negateCondition` and `swapComparison`
+2. **Single file target** — mutate one source file (e.g., a module that `SampleTests` imports)
+3. **All tests run per mutation** — skip the DepGraph filtering initially for simplicity
+4. **Text output** — print surviving mutants to console with file/line/description
+5. **No caching** — add Cache integration after the core loop works
 
-This should be achievable in ~200-300 lines of Elm across `Mutator.elm` and `MutationTestRunner.elm`, building entirely on elm-build's existing Cache and DepGraph infrastructure.
+This should be ~200-300 lines of Elm across `Mutator.elm` and `MutationTestRunner.elm`.
 
 ### Future extensions
 
-- **Coverage-guided mutation**: only mutate covered expressions (skip what you know is untested — you already know that from elm-pages `--coverage`)
+- **Coverage-guided mutation**: only mutate covered expressions (skip what you know is untested — use the lcov data from elm-pages `--coverage`)
 - **Equivalent mutant detection**: some mutations produce semantically identical code (e.g., negating a condition that's always true). Use heuristics or type info to skip these.
+- **Cache integration**: hash (mutated source + test labels) → cache mutation test results across runs. Only re-test mutations when relevant source changes.
 - **Mutation testing in CI**: fail the build if mutation score drops below a threshold
 - **LLM loop**: feed surviving mutants to an LLM, have it generate new tests, re-run mutation testing, repeat until mutation score target is hit
+- **Parallel mutation evaluation**: since each mutation is independent, evaluate multiple mutations concurrently using elm-build's `combineBy` parallelism
